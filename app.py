@@ -3,32 +3,37 @@ import os
 import requests
 import yt_dlp
 import static_ffmpeg
+import subprocess
 from werkzeug.utils import secure_filename
 from urllib.parse import quote
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SECRET_KEY'] = 'your-social-downloader-key'
 
-# Initialize FFmpeg
+# Initialize FFmpeg - Crucial for YouTube playback fix
 static_ffmpeg.add_paths()
 
 class UniversalDownloader:
     def __init__(self):
         self.session = requests.Session()
-        # Modern User-Agent to prevent "damaged file" blocks from Meta/Instagram
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
         
+    def detect_platform(self, url):
+        url = url.lower()
+        if 'youtube.com' in url or 'youtu.be' in url: return 'youtube'
+        if 'instagram.com' in url: return 'instagram'
+        if 'facebook.com' in url or 'fb.watch' in url: return 'facebook'
+        return 'generic'
+
     def get_info(self, url):
-        """Extracts metadata with a deep-search for the best MP4 stream."""
         ydl_opts = {
-            # Priority: 1. Merged MP4, 2. Best Video + Best Audio, 3. Any best format
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            # YouTube needs the + merge, others just take 'best'
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
-            # 'cookiefile': 'cookies.txt', # Highly recommended for Instagram/FB
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
@@ -48,7 +53,6 @@ def handle_ui_request():
             return jsonify({'status': 'error', 'message': 'URL is required'}), 400
 
         info = downloader.get_info(url)
-        
         return jsonify({
             'status': 'success',
             'title': info.get('title', 'Video'),
@@ -63,60 +67,72 @@ def stream_to_client():
     if not url:
         return "URL Required", 400
 
+    platform = downloader.detect_platform(url)
+
     try:
         info = downloader.get_info(url)
-        
-        # --- THE FIX: URL HUNTING LOGIC ---
-        media_url = None
-        
-        # 1. Check direct URL
-        if info.get('url'):
-            media_url = info['url']
-        # 2. Check entries (common for FB/Insta)
-        elif info.get('entries'):
-            media_url = info['entries'][0].get('url')
-        # 3. Check requested_formats (common for YT)
-        elif info.get('requested_formats'):
-            # If YouTube separates them, we pick the one that contains both or the first video
-            media_url = info['requested_formats'][0].get('url')
-        
-        if not media_url:
-            return "Could not find a valid streamable URL for this media.", 404
-
         filename = secure_filename(f"{info.get('title', 'video')}.mp4")
-        
-        # Setup headers for the outbound request to the platform
-        request_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        }
-        if info.get('http_headers'):
-            request_headers.update(info['http_headers'])
 
-        # Start the stream from the platform
-        platform_req = requests.get(media_url, stream=True, headers=request_headers, timeout=60)
-        platform_req.raise_for_status()
-
-        def generate():
-            # Use 64KB chunks to keep the pipe active and prevent timeouts
-            for chunk in platform_req.iter_content(chunk_size=65536):
-                if chunk:
+        # ==========================================
+        # ENGINE A: YOUTUBE (Merging Audio/Video)
+        # ==========================================
+        if platform == 'youtube':
+            def generate_yt():
+                # We use -o - to pipe the output through stdout
+                # We use --merge-output-format mp4 to ensure it's playable
+                proc = subprocess.Popen(
+                    [
+                        'yt-dlp', 
+                        '-o', '-', 
+                        '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                        '--merge-output-format', 'mp4',
+                        '--no-playlist',
+                        url
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL
+                )
+                while True:
+                    chunk = proc.stdout.read(1024 * 64) # 64KB chunks
+                    if not chunk:
+                        break
                     yield chunk
+                proc.terminate()
 
-        # Build the response back to the user's browser
-        response = Response(
-            stream_with_context(generate()),
-            headers={
+            return Response(stream_with_context(generate_yt()), headers={
                 "Content-Disposition": f"attachment; filename=\"{filename}\"",
-                "Content-Type": "video/mp4",
-                "X-Content-Type-Options": "nosniff"
-            }
-        )
+                "Content-Type": "video/mp4"
+            })
 
-        # Content-Length is vital so the browser doesn't think the file is "damaged"
-        if platform_req.headers.get('Content-Length'):
-            response.headers["Content-Length"] = platform_req.headers.get('Content-Length')
+        # ==========================================
+        # ENGINE B: FB / INSTA (Direct Pipe)
+        # ==========================================
+        else:
+            # Re-run the URL hunting logic to ensure we don't get 'None'
+            media_url = info.get('url')
+            if not media_url and info.get('entries'):
+                media_url = info['entries'][0].get('url')
+            elif not media_url and info.get('requested_formats'):
+                media_url = info['requested_formats'][0].get('url')
 
-        return response
+            # We use the same headers that yt-dlp uses to satisfy security checks
+            request_headers = info.get('http_headers', {})
+            req = requests.get(media_url, stream=True, headers=request_headers, timeout=60)
+            
+            def generate_direct():
+                for chunk in req.iter_content(chunk_size=65536):
+                    if chunk: yield chunk
+
+            response = Response(stream_with_context(generate_direct()), headers={
+                "Content-Disposition": f"attachment; filename=\"{filename}\"",
+                "Content-Type": "video/mp4"
+            })
+            
+            # Carry over the file size so the browser can show a progress bar
+            if req.headers.get('Content-Length'):
+                response.headers["Content-Length"] = req.headers.get('Content-Length')
+            
+            return response
 
     except Exception as e:
         return f"Streaming Error: {str(e)}", 500
